@@ -504,10 +504,9 @@ async function sendWithKeyboard(text, keyboard) {
 }
 
 async function editTelegramMessage(messageId, text, keyboard) {
-  const res = await telegramRequest('editMessageText', {
-    chat_id: CHAT_ID, message_id: parseInt(messageId),
-    text, parse_mode: 'Markdown', reply_markup: keyboard
-  });
+  const payload = { chat_id: CHAT_ID, message_id: parseInt(messageId), text, parse_mode: 'Markdown' };
+  if (keyboard !== undefined) payload.reply_markup = keyboard;
+  const res = await telegramRequest('editMessageText', payload);
   if (!res.ok) {
     if (res.description && res.description.includes('not modified')) return res;
     console.error('Edit error:', res.description);
@@ -757,7 +756,7 @@ async function handleUpdate(update) {
       : groupByOwner(collapsePlatforms(await getPostsForDate(dateStr)));
     const pendingLines = getCachedPendingLines();
     const rebuilt      = buildFullMessage(grouped, dateStr, statuses, pendingLines);
-    await editTelegramMessage(messageId, rebuilt.text, rebuilt.keyboard);
+    await editTelegramMessage(messageId, rebuilt.text); // buttons unchanged on tap
   });
 }
 
