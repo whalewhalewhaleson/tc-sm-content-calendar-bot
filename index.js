@@ -685,20 +685,60 @@ async function handleUpdate(update) {
     if (update.update_id && update.update_id <= _lastUpdateId) return;
     if (update.update_id) _lastUpdateId = update.update_id;
 
-    const text = String(update.message.text).trim();
+    const text      = String(update.message.text).trim();
+    const replyChat = String(update.message.chat.id);
+    const reply     = (msg) => telegramRequest('sendMessage', { chat_id: replyChat, text: msg, parse_mode: 'Markdown' })
+                                 .catch(e => console.error('reply error:', e.message));
     try {
-      const botName   = await getBotUsername();
-      const isRefresh = text === '/refresh' || text === `/refresh@${botName}`;
-      const isSync    = text === '/syncposted' || text === `/syncposted@${botName}`;
-      if (isRefresh) {
+      const botName     = await getBotUsername();
+      const cmd = (c) => text === `/${c}` || text === `/${c}@${botName}`;
+
+      if (cmd('refresh')) {
         await refreshTodayDigest();
-        await sendTelegramMessage('✅ Digest refreshed — any new posts have been added.');
-      } else if (isSync) {
+        await reply('✅ Digest refreshed — any new posts have been added.');
+
+      } else if (cmd('syncposted')) {
         await syncPostedColumn();
-        await sendTelegramMessage('✅ Posted column synced — sheet_row values repaired if needed.');
+        await reply('✅ Posted column synced.');
+
+      } else if (cmd('morning')) {
+        const existing = getCachedStatuses();
+        if (existing && existing.dateStr === getTodayString() && existing.messages?.length) {
+          await refreshTodayDigest();
+          await reply('ℹ️ Digest already sent today — refreshed instead.');
+        } else {
+          await sendMorningDigest();
+          await reply('✅ Morning digest sent.');
+        }
+
+      } else if (cmd('reminder')) {
+        await sendPendingReminder('manual');
+        await reply('✅ Reminder check done.');
+
+      } else if (cmd('status')) {
+        const cached = getCachedStatuses();
+        if (!cached || cached.dateStr !== getTodayString()) {
+          await reply('No digest sent today yet. Use /morning to send one.');
+        } else {
+          const statuses = cached.statuses || {};
+          const total    = Object.keys(statuses).length;
+          const posted   = Object.values(statuses).filter(s => s === 'posted').length;
+          await reply(`📊 *Today — ${cached.dateStr}*\n✅ ${posted} posted / ${total - posted} pending`);
+        }
+
+      } else if (cmd('help')) {
+        await reply(
+          '*Available commands*\n' +
+          '/morning — Send today\'s digest (or refresh if already sent)\n' +
+          '/refresh — Refresh digest with new posts from sheet\n' +
+          '/reminder — Check pending posts now\n' +
+          '/status — Today\'s post summary\n' +
+          '/syncposted — Sync posted column in sheet\n' +
+          '/help — Show this list'
+        );
       }
     } catch (err) {
-      await sendTelegramMessage('⚠️ Command failed: ' + err.message);
+      await reply('⚠️ Command failed: ' + err.message);
     }
     return;
   }
@@ -747,8 +787,8 @@ async function handleUpdate(update) {
         statuses[pk]   = String(dbData[i][3]);
         rowIndices[pk] = i + 1;
       }
-      // Reconstruct messages list from known chat IDs + the tapped message
-      messages = CHAT_IDS.map(chatId => ({ chatId, messageId: chatId === String(cq.message.chat.id) ? mid : mid }));
+      // On cold start we only know the tapped message — edit that one only
+      messages = [{ chatId: String(cq.message.chat.id), messageId: mid }];
     }
 
     if ((action === 'mark_posted' || action === 'mark_pending' || action === 'toggle') && target !== '') {
@@ -798,6 +838,24 @@ async function registerWebhook() {
   console.log('Webhook registered:', JSON.stringify(res));
 }
 
+async function registerCommands() {
+  try {
+    await telegramRequest('setMyCommands', {
+      commands: [
+        { command: 'morning',     description: "Send today's digest (or refresh if already sent)" },
+        { command: 'refresh',     description: 'Refresh digest with new posts from sheet' },
+        { command: 'reminder',    description: 'Check pending posts now' },
+        { command: 'status',      description: "Today's post count summary" },
+        { command: 'syncposted',  description: 'Sync posted column in sheet' },
+        { command: 'help',        description: 'Show all commands' },
+      ]
+    });
+    console.log('Bot commands registered.');
+  } catch (e) {
+    console.error('registerCommands error:', e.message);
+  }
+}
+
 // ── CRON JOBS ─────────────────────────────────────────────────
 cron.schedule('0 9 * * *',  () => sendMorningDigest(),        { timezone: TIMEZONE });
 cron.schedule('0 18 * * *', () => sendPendingReminder('6pm'), { timezone: TIMEZONE });
@@ -808,4 +866,5 @@ cron.schedule('0 23 * * *', () => syncPostedColumn(),         { timezone: TIMEZO
 app.listen(PORT, async () => {
   console.log(`Bot running on port ${PORT}`);
   await registerWebhook();
+  await registerCommands();
 });
