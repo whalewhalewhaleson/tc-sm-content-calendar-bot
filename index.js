@@ -405,6 +405,7 @@ async function buildPendingReminderText(dateStr) {
 
   for (let i = 1; i < data.length; i++) {
     if (normaliseDateCell(data[i][0]) !== dateStr) continue;
+    if (String(data[i][2]).trim() === '__state__') continue;
     hasEntry = true;
     if (String(data[i][3]) !== 'posted') pending++;
   }
@@ -467,6 +468,7 @@ async function buildYesterdayPendingLines(yStr) {
 
   for (let i = 1; i < trackerData.length; i++) {
     if (normaliseDateCell(trackerData[i][0]) !== yStr) continue;
+    if (String(trackerData[i][2]).trim() === '__state__') continue;
     if (String(trackerData[i][3]) === 'posted') continue;
 
     const sheetRow = parseInt(trackerData[i][5]);
@@ -560,6 +562,11 @@ async function sendMorningDigest() {
     const initStatuses = {};
     for (const p of flatPosts) initStatuses[postKey(p)] = 'pending';
     setCachedStatuses({ dateStr, messages, statuses: initStatuses, rowIndices });
+
+    // Persist messages array so cache can be restored after a restart
+    appendRows(TRACKER_SHEET, [[dateStr, JSON.stringify(messages), '__state__', 'ok', '', '']])
+      .catch(e => console.error('State row write error:', e.message));
+
     console.log('Morning digest sent to', messages.length, 'group(s). Primary ID:', primaryId);
   } catch (e) {
     console.error('Morning error:', e.message);
@@ -663,6 +670,7 @@ async function syncPostedColumn() {
     for (let i = 1; i < trackerData.length; i++) {
       if (normaliseDateCell(trackerData[i][0]) !== today) continue;
       const pkey      = String(trackerData[i][2]);
+      if (pkey.trim() === '__state__') continue;
       const lookedUp  = rowLookup[pkey];
       const actualRow = lookedUp || parseInt(trackerData[i][5]);
       if (!actualRow) continue;
@@ -814,7 +822,7 @@ async function handleUpdate(update) {
       : groupByOwner(collapsePlatforms(await getPostsForDate(dateStr)));
     const pendingLines = getCachedPendingLines();
     const rebuilt      = buildFullMessage(grouped, dateStr, statuses, pendingLines);
-    await editAllMessages(messages, rebuilt.text); // buttons unchanged on tap
+    await editAllMessages(messages, rebuilt.text, rebuilt.keyboard);
   });
 }
 
@@ -836,6 +844,45 @@ async function registerWebhook() {
   if (!webhookUrl) { console.warn('WEBHOOK_URL not set — skipping webhook registration.'); return; }
   const res = await telegramRequest('setWebhook', { url: `${webhookUrl}/webhook` });
   console.log('Webhook registered:', JSON.stringify(res));
+}
+
+async function restoreCacheFromTracker() {
+  try {
+    const today = getTodayString();
+    const [trackerData, postData] = await Promise.all([
+      getSheetValues(TRACKER_SHEET),
+      getSheetValues(SHEET_NAME)
+    ]);
+
+    let messages = null;
+    const statuses   = {};
+    const rowIndices = {};
+
+    for (let i = 1; i < trackerData.length; i++) {
+      if (normaliseDateCell(trackerData[i][0]) !== today) continue;
+      const pk = String(trackerData[i][2]).trim();
+      if (pk === '__state__') {
+        try { messages = JSON.parse(trackerData[i][1]); } catch (_) {}
+        continue;
+      }
+      statuses[pk]   = String(trackerData[i][3]);
+      rowIndices[pk] = i + 1;
+    }
+
+    if (!messages || !messages.length) { console.log('No state row for today — starting fresh.'); return; }
+
+    const posts = await getPostsForDate(today);
+    if (posts.length) {
+      const grouped = groupByOwner(collapsePlatforms(posts));
+      cacheGrouped(today, grouped);
+    }
+    const pendingLines = await buildYesterdayPendingLines(getYesterdayString());
+    setCachedPendingLines(pendingLines);
+    setCachedStatuses({ dateStr: today, messages, statuses, rowIndices });
+    console.log('Cache restored from tracker. Message IDs:', messages.map(m => m.messageId).join(', '));
+  } catch (e) {
+    console.error('restoreCacheFromTracker error:', e.message);
+  }
 }
 
 async function registerCommands() {
@@ -867,4 +914,5 @@ app.listen(PORT, async () => {
   console.log(`Bot running on port ${PORT}`);
   await registerWebhook();
   await registerCommands();
+  await restoreCacheFromTracker();
 });
