@@ -10,7 +10,7 @@ const { DateTime } = require('luxon');
 // ── CONFIG ────────────────────────────────────────────────────
 const BOT_TOKEN     = process.env.BOT_TOKEN;
 const SHEET_ID      = '1a2aASYC8qUd0knij8GmuAo-yZzRaqlTW4-j5Uhfam-g';
-const CHAT_ID       = '-5256560725';
+const CHAT_IDS      = (process.env.CHAT_IDS || '-5256560725,-5007304081').split(',').map(s => s.trim());
 const SHEET_NAME    = 'Posts';
 const TRACKER_SHEET = 'Bot_Tracker';
 const TIMEZONE      = 'Asia/Singapore';
@@ -490,28 +490,40 @@ async function telegramRequest(method, payload) {
 }
 
 async function sendTelegramMessage(text) {
-  const res = await telegramRequest('sendMessage', { chat_id: CHAT_ID, text, parse_mode: 'Markdown' });
-  if (!res.ok) throw new Error('Telegram error: ' + res.description);
-  return res;
+  await Promise.all(CHAT_IDS.map(chatId =>
+    telegramRequest('sendMessage', { chat_id: chatId, text, parse_mode: 'Markdown' })
+      .catch(e => console.error(`sendMessage error (${chatId}):`, e.message))
+  ));
 }
 
+// Sends to all groups, returns [{ chatId, messageId }, ...]
 async function sendWithKeyboard(text, keyboard) {
-  const res = await telegramRequest('sendMessage', {
-    chat_id: CHAT_ID, text, parse_mode: 'Markdown', reply_markup: keyboard
-  });
-  if (!res.ok) throw new Error('Telegram send error: ' + res.description);
-  return res;
+  const results = [];
+  for (const chatId of CHAT_IDS) {
+    const res = await telegramRequest('sendMessage', {
+      chat_id: chatId, text, parse_mode: 'Markdown', reply_markup: keyboard
+    });
+    if (res.ok) results.push({ chatId, messageId: String(res.result.message_id) });
+    else console.error(`sendWithKeyboard error (${chatId}):`, res.description);
+  }
+  return results;
 }
 
-async function editTelegramMessage(messageId, text, keyboard) {
-  const payload = { chat_id: CHAT_ID, message_id: parseInt(messageId), text, parse_mode: 'Markdown' };
+async function editTelegramMessage(chatId, messageId, text, keyboard) {
+  const payload = { chat_id: chatId, message_id: parseInt(messageId), text, parse_mode: 'Markdown' };
   if (keyboard !== undefined) payload.reply_markup = keyboard;
   const res = await telegramRequest('editMessageText', payload);
-  if (!res.ok) {
-    if (res.description && res.description.includes('not modified')) return res;
-    console.error('Edit error:', res.description);
+  if (!res.ok && !(res.description && res.description.includes('not modified'))) {
+    console.error(`Edit error (${chatId}):`, res.description);
   }
   return res;
+}
+
+async function editAllMessages(messages, text, keyboard) {
+  await Promise.all(messages.map(({ chatId, messageId }) =>
+    editTelegramMessage(chatId, messageId, text, keyboard)
+      .catch(e => console.error('editAllMessages error:', e.message))
+  ));
 }
 
 async function answerCallbackQuery(callbackQueryId, text) {
@@ -539,15 +551,16 @@ async function sendMorningDigest() {
     const pendingLines = await buildYesterdayPendingLines(getYesterdayString());
     setCachedPendingLines(pendingLines);
 
-    const msg        = buildFullMessage(grouped, dateStr, {}, pendingLines);
-    const result     = await sendWithKeyboard(msg.text, msg.keyboard);
-    const rowIndices = await saveTrackerEntry(dateStr, result.result.message_id, flatPosts, {});
+    const msg      = buildFullMessage(grouped, dateStr, {}, pendingLines);
+    const messages = await sendWithKeyboard(msg.text, msg.keyboard);
+    const primaryId = messages[0]?.messageId;
+    const rowIndices = await saveTrackerEntry(dateStr, primaryId, flatPosts, {});
     cacheGrouped(dateStr, grouped);
 
     const initStatuses = {};
     for (const p of flatPosts) initStatuses[postKey(p)] = 'pending';
-    setCachedStatuses({ dateStr, messageId: String(result.result.message_id), statuses: initStatuses, rowIndices });
-    console.log('Morning digest sent. Message ID:', result.result.message_id);
+    setCachedStatuses({ dateStr, messages, statuses: initStatuses, rowIndices });
+    console.log('Morning digest sent to', messages.length, 'group(s). Primary ID:', primaryId);
   } catch (e) {
     console.error('Morning error:', e.message);
     try { await sendTelegramMessage('⚠️ Bot Error (morning)\n' + e.message); } catch (_) {}
@@ -558,28 +571,29 @@ async function sendMorningDigest() {
 async function refreshTodayDigest() {
   const dateStr    = getTodayString();
   const cachedData = getCachedStatuses();
-  if (!cachedData || !cachedData.messageId) {
+  const messages = cachedData?.messages || [];
+  if (!cachedData || !messages.length) {
     console.log('refreshTodayDigest: no morning message found, skipping.');
     return;
   }
   const statuses   = cachedData.statuses   || {};
   const rowIndices = cachedData.rowIndices || {};
-  const messageId  = cachedData.messageId;
+  const primaryId  = messages[0]?.messageId;
 
   const freshPosts = await getPostsForDate(dateStr);
   if (!freshPosts.length) return;
 
-  const existing    = await getSheetValues(TRACKER_SHEET);
-  let nextRow       = existing.length + 1;
-  const newRows     = [];
-  const newPosts    = [];
+  const existing = await getSheetValues(TRACKER_SHEET);
+  let nextRow    = existing.length + 1;
+  const newRows  = [];
+  const newPosts = [];
 
   for (const p of freshPosts) {
     const key = postKey(p);
     if (!Object.prototype.hasOwnProperty.call(statuses, key)) {
       newPosts.push(p);
       statuses[key] = 'pending';
-      newRows.push([dateStr, String(messageId), key, 'pending', p.owner || '', p.sheetRow || '']);
+      newRows.push([dateStr, String(primaryId), key, 'pending', p.owner || '', p.sheetRow || '']);
       rowIndices[key] = nextRow++;
     }
   }
@@ -595,7 +609,7 @@ async function refreshTodayDigest() {
 
   const pendingLines = getCachedPendingLines();
   const rebuilt      = buildFullMessage(grouped, dateStr, statuses, pendingLines);
-  await editTelegramMessage(messageId, rebuilt.text, rebuilt.keyboard);
+  await editAllMessages(messages, rebuilt.text, rebuilt.keyboard);
   console.log(`refreshTodayDigest: ${newPosts.length ? `added ${newPosts.length} new post(s)` : 'no new posts'}, digest updated.`);
 }
 
@@ -713,24 +727,28 @@ async function handleUpdate(update) {
     if (update.update_id) _lastUpdateId = update.update_id;
 
     const mid       = String(messageId);
-    let cachedData  = getCachedStatuses();
-    let statuses    = {};
-    let rowIndices  = {};
-    let dateStr     = getTodayString();
+    let cachedData = getCachedStatuses();
+    let statuses   = {};
+    let rowIndices = {};
+    let dateStr    = getTodayString();
+    let messages   = [];
 
     if (cachedData) {
       statuses   = cachedData.statuses   || {};
       rowIndices = cachedData.rowIndices || {};
       dateStr    = cachedData.dateStr    || getTodayString();
+      messages   = cachedData.messages   || [];
     } else {
+      // Cold start: rebuild from tracker by date
       const dbData = await getSheetValues(TRACKER_SHEET);
       for (let i = 1; i < dbData.length; i++) {
-        if (String(dbData[i][1]) !== mid) continue;
-        dateStr = normaliseDateCell(dbData[i][0]);
+        if (normaliseDateCell(dbData[i][0]) !== dateStr) continue;
         const pk = String(dbData[i][2]).trim();
         statuses[pk]   = String(dbData[i][3]);
         rowIndices[pk] = i + 1;
       }
+      // Reconstruct messages list from known chat IDs + the tapped message
+      messages = CHAT_IDS.map(chatId => ({ chatId, messageId: chatId === String(cq.message.chat.id) ? mid : mid }));
     }
 
     if ((action === 'mark_posted' || action === 'mark_pending' || action === 'toggle') && target !== '') {
@@ -756,7 +774,7 @@ async function handleUpdate(update) {
       : groupByOwner(collapsePlatforms(await getPostsForDate(dateStr)));
     const pendingLines = getCachedPendingLines();
     const rebuilt      = buildFullMessage(grouped, dateStr, statuses, pendingLines);
-    await editTelegramMessage(messageId, rebuilt.text); // buttons unchanged on tap
+    await editAllMessages(messages, rebuilt.text); // buttons unchanged on tap
   });
 }
 
