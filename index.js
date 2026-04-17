@@ -741,12 +741,13 @@ async function handleUpdate(update) {
 
       if (statuses[target] !== newStatus) {
         statuses[target] = newStatus;
-        if (rowIndices[target]) {
-          await updateCell(TRACKER_SHEET, rowIndices[target], 4, newStatus);
-        } else {
-          await appendRows(TRACKER_SHEET, [[dateStr, mid, target, newStatus, '', '']]);
-        }
         if (cachedData) { cachedData.statuses = statuses; setCachedStatuses(cachedData); }
+        // Write to Sheets in background — don't block the message edit
+        if (rowIndices[target]) {
+          updateCell(TRACKER_SHEET, rowIndices[target], 4, newStatus).catch(e => console.error('Tracker write error:', e));
+        } else {
+          appendRows(TRACKER_SHEET, [[dateStr, mid, target, newStatus, '', '']]).catch(e => console.error('Tracker append error:', e));
+        }
       }
     }
 
