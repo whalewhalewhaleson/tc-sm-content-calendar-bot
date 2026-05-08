@@ -15,6 +15,7 @@ const SHEET_NAME    = 'Posts';
 const TRACKER_SHEET = 'Bot_Tracker';
 const TIMEZONE      = 'Asia/Singapore';
 const PORT          = process.env.PORT || 3000;
+const PAGE_SIZE     = 5;
 
 // ── OWNER → EMAIL ─────────────────────────────────────────────
 const OWNER_EMAILS = {
@@ -52,6 +53,14 @@ const HANDLE_LABEL = {
   thatsoundspot:          'TSS'
 };
 
+const OWNER_TELEGRAM = {
+  mavia:    '@m4via',
+  yov:      '@yovannalo',
+  yovanna:  '@yovannalo',
+  hari:     '@prixx_05',
+  haripria: '@prixx_05',
+};
+
 // ── IN-MEMORY CACHE (replaces PropertiesService) ──────────────
 const _cache = {};
 function setProp(key, value) {
@@ -73,6 +82,7 @@ function withLock(fn) {
 
 // ── DEDUP ─────────────────────────────────────────────────────
 let _lastUpdateId = 0;
+const _sentTimeReminders = new Set();
 
 // ── GOOGLE SHEETS ─────────────────────────────────────────────
 let _sheets = null;
@@ -175,7 +185,13 @@ function normaliseTimeCell(raw) {
     if (h === 0 && m === 0) return '';
     return DateTime.fromObject({ hour: h, minute: m }).toFormat('h:mm a');
   }
-  return String(raw).trim();
+  const str = String(raw).trim();
+  if (!str) return '';
+  for (const fmt of ['h:mm a', 'H:mm', 'h:mm']) {
+    const dt = DateTime.fromFormat(str, fmt);
+    if (dt.isValid) return dt.toFormat('h:mm a');
+  }
+  return str;
 }
 
 // ── TEXT HELPERS ──────────────────────────────────────────────
@@ -191,6 +207,13 @@ function getBrandEmoji(brand) {
 function getHandleLabel(handle) {
   if (!handle) return handle;
   return HANDLE_LABEL[handle.toLowerCase().trim()] || handle;
+}
+
+function ownerMention(owner) {
+  if (!owner) return '';
+  const handle = OWNER_TELEGRAM[owner.toLowerCase().trim()];
+  if (handle) return handle;
+  return escapeMd(owner);
 }
 
 // ── PARSE POST ROW ────────────────────────────────────────────
@@ -395,6 +418,33 @@ function buildFullMessage(grouped, dateStr, statuses, pendingLines) {
   });
 
   return { text: lines.join('\n'), keyboard: { inline_keyboard: buttons } };
+}
+
+// ── PENDING LIST (paginated) ──────────────────────────────────
+function buildPendingMessage(pendingPosts, page) {
+  if (pendingPosts.length === 0) {
+    return { text: '✅ All posts ticked for today!', keyboard: { inline_keyboard: [] } };
+  }
+
+  const totalPages = Math.ceil(pendingPosts.length / PAGE_SIZE);
+  page = Math.max(0, Math.min(page, totalPages - 1));
+  const slice = pendingPosts.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE);
+
+  let text = `📋 *Pending — ${page + 1} of ${totalPages}* (${pendingPosts.length} outstanding)\n\n`;
+  for (const p of slice) {
+    text += '• ';
+    if (p.postingTime) text += `${p.postingTime}: `;
+    text += `${p.label} | ${p.platforms} — ${escapeMd(p.postName)}`;
+    const mention = ownerMention(p.owner);
+    if (mention) text += ` (${mention})`;
+    text += '\n';
+  }
+
+  const navRow = [];
+  if (page > 0)              navRow.push({ text: '◀️ Prev', callback_data: `pending_page|${page - 1}` });
+  if (page < totalPages - 1) navRow.push({ text: 'Next ▶️', callback_data: `pending_page|${page + 1}` });
+
+  return { text: text.trim(), keyboard: { inline_keyboard: navRow.length ? [navRow] : [] } };
 }
 
 // ── PENDING REMINDER TEXT ─────────────────────────────────────
@@ -638,6 +688,44 @@ async function sendPendingReminder(label) {
   }
 }
 
+// ── POST-TIME REMINDER ────────────────────────────────────────
+async function sendPostTimeReminders() {
+  try {
+    const dateStr  = getTodayString();
+    const now      = DateTime.now().setZone(TIMEZONE);
+    const timeSlot = now.toFormat('h:mm a');
+    const key      = `${dateStr}|${timeSlot}`;
+    if (_sentTimeReminders.has(key)) return;
+
+    const cachedData = getCachedStatuses();
+    if (!cachedData || cachedData.dateStr !== dateStr) return;
+    const statuses = cachedData.statuses || {};
+
+    const cache = getCachedGrouped();
+    if (!cache) return;
+
+    const due = cache.flat.filter(p =>
+      p.postingTime === timeSlot &&
+      (statuses[postKey(p)] || 'pending') === 'pending'
+    );
+    if (!due.length) return;
+
+    _sentTimeReminders.add(key);
+
+    let msg = `⏰ *Post now — ${timeSlot}*\n\n`;
+    for (const p of due) {
+      msg += `• ${p.label} | ${p.platforms} — ${escapeMd(p.postName)}`;
+      const mention = ownerMention(p.owner);
+      if (mention) msg += ` (${mention})`;
+      msg += '\n';
+    }
+    await sendTelegramMessage(msg.trim());
+    console.log(`Post-time reminder sent for ${timeSlot}: ${due.length} post(s).`);
+  } catch (e) {
+    console.error('sendPostTimeReminders error:', e.message);
+  }
+}
+
 // ── SYNC POSTED COLUMN ────────────────────────────────────────
 async function syncPostedColumn() {
   try {
@@ -734,13 +822,30 @@ async function handleUpdate(update) {
           await reply(`📊 *Today — ${cached.dateStr}*\n✅ ${posted} posted / ${total - posted} pending`);
         }
 
+      } else if (cmd('pending')) {
+        const cachedData = getCachedStatuses();
+        if (!cachedData || cachedData.dateStr !== getTodayString()) {
+          await reply('No digest sent today yet. Use /morning to send one.');
+        } else {
+          const statuses = cachedData.statuses || {};
+          const cache    = getCachedGrouped();
+          const flat     = cache ? cache.flat : [];
+          const pending  = flat.filter(p => (statuses[postKey(p)] || 'pending') === 'pending');
+          const msg      = buildPendingMessage(pending, 0);
+          await telegramRequest('sendMessage', {
+            chat_id: replyChat, text: msg.text,
+            parse_mode: 'Markdown', reply_markup: msg.keyboard
+          });
+        }
+
       } else if (cmd('help')) {
         await reply(
           '*Available commands*\n' +
           '/morning — Send today\'s digest (or refresh if already sent)\n' +
           '/refresh — Refresh digest with new posts from sheet\n' +
           '/reminder — Check pending posts now\n' +
-          '/status — Today\'s post summary\n' +
+          '/pending — List all outstanding posts\n' +
+          '/status — Today\'s post count summary\n' +
           '/syncposted — Sync posted column in sheet\n' +
           '/help — Show this list'
         );
@@ -758,6 +863,25 @@ async function handleUpdate(update) {
   const parts     = cq.data.split('|');
   const action    = parts[0];
   let target      = parts.length > 1 ? parts.slice(1).join('|').trim() : '';
+
+  // Pending pagination — handle before numeric target resolution
+  if (action === 'pending_page') {
+    const page       = parseInt(target) || 0;
+    const cachedData = getCachedStatuses();
+    const statuses   = cachedData?.statuses || {};
+    const cache      = getCachedGrouped();
+    const flat       = cache ? cache.flat : [];
+    const pending    = flat.filter(p => (statuses[postKey(p)] || 'pending') === 'pending');
+    const msg        = buildPendingMessage(pending, page);
+    await editTelegramMessage(
+      String(cq.message.chat.id),
+      String(cq.message.message_id),
+      msg.text,
+      msg.keyboard
+    );
+    await answerCallbackQuery(cq.id, '');
+    return;
+  }
 
   if (/^\d+$/.test(target)) {
     const flatCache = getCachedGrouped();
@@ -892,6 +1016,7 @@ async function registerCommands() {
         { command: 'morning',     description: "Send today's digest (or refresh if already sent)" },
         { command: 'refresh',     description: 'Refresh digest with new posts from sheet' },
         { command: 'reminder',    description: 'Check pending posts now' },
+        { command: 'pending',     description: 'List all outstanding posts' },
         { command: 'status',      description: "Today's post count summary" },
         { command: 'syncposted',  description: 'Sync posted column in sheet' },
         { command: 'help',        description: 'Show all commands' },
@@ -908,6 +1033,7 @@ cron.schedule('0 9 * * *',  () => sendMorningDigest(),        { timezone: TIMEZO
 cron.schedule('0 18 * * *', () => sendPendingReminder('6pm'), { timezone: TIMEZONE });
 cron.schedule('0 21 * * *', () => sendPendingReminder('9pm'), { timezone: TIMEZONE });
 cron.schedule('0 23 * * *', () => syncPostedColumn(),         { timezone: TIMEZONE });
+cron.schedule('* * * * *',  () => sendPostTimeReminders(),    { timezone: TIMEZONE });
 
 // ── START ─────────────────────────────────────────────────────
 app.listen(PORT, async () => {
