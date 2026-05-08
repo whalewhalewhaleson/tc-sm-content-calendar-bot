@@ -83,6 +83,7 @@ function withLock(fn) {
 // ── DEDUP ─────────────────────────────────────────────────────
 let _lastUpdateId = 0;
 const _sentTimeReminders = new Set();
+let _outstandingCache = null;
 
 // ── GOOGLE SHEETS ─────────────────────────────────────────────
 let _sheets = null;
@@ -420,21 +421,28 @@ function buildFullMessage(grouped, dateStr, statuses, pendingLines) {
   return { text: lines.join('\n'), keyboard: { inline_keyboard: buttons } };
 }
 
-// ── PENDING LIST (paginated) ──────────────────────────────────
-function buildPendingMessage(pendingPosts, page) {
-  if (pendingPosts.length === 0) {
-    return { text: '✅ All posts ticked for today!', keyboard: { inline_keyboard: [] } };
+// ── PENDING LIST (paginated, all dates) ───────────────────────
+function buildPendingMessage(allPending, page) {
+  if (allPending.length === 0) {
+    return { text: '✅ No outstanding posts!', keyboard: { inline_keyboard: [] } };
   }
 
-  const totalPages = Math.ceil(pendingPosts.length / PAGE_SIZE);
+  const totalPages = Math.ceil(allPending.length / PAGE_SIZE);
   page = Math.max(0, Math.min(page, totalPages - 1));
-  const slice = pendingPosts.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE);
+  const slice = allPending.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE);
 
-  let text = `📋 *Pending — ${page + 1} of ${totalPages}* (${pendingPosts.length} outstanding)\n\n`;
+  let text = `📋 *Outstanding — ${page + 1} of ${totalPages}* (${allPending.length} total)\n\n`;
+  let lastDate = '';
   for (const p of slice) {
+    if (p.dateStr !== lastDate) {
+      if (lastDate) text += '\n';
+      text += `📅 *${p.dateStr}*\n`;
+      lastDate = p.dateStr;
+    }
     text += '• ';
     if (p.postingTime) text += `${p.postingTime}: `;
-    text += `${p.label} | ${p.platforms} — ${escapeMd(p.postName)}`;
+    if (p.label && p.platforms) text += `${p.label} | ${p.platforms} — `;
+    text += escapeMd(p.postName);
     const mention = ownerMention(p.owner);
     if (mention) text += ` (${mention})`;
     text += '\n';
@@ -445,6 +453,98 @@ function buildPendingMessage(pendingPosts, page) {
   if (page < totalPages - 1) navRow.push({ text: 'Next ▶️', callback_data: `pending_page|${page + 1}` });
 
   return { text: text.trim(), keyboard: { inline_keyboard: navRow.length ? [navRow] : [] } };
+}
+
+// ── OUTSTANDING POSTS (all dates, Sheets-backed) ──────────────
+async function getOutstandingPosts() {
+  const now = Date.now();
+  if (_outstandingCache && (now - _outstandingCache.fetchedAt) < 5 * 60 * 1000) {
+    return _outstandingCache.posts;
+  }
+
+  const today = getTodayString();
+  const [trackerData, postData] = await Promise.all([
+    getSheetValues(TRACKER_SHEET),
+    getSheetValues(SHEET_NAME)
+  ]);
+  const postHeaders = postData.length ? postData[0].map(h => String(h).trim().toLowerCase()) : [];
+  const COL = getColumnIndices(postHeaders);
+
+  // Merge tracker rows — last status wins per (dateStr, postKey)
+  const seen = {};
+  for (let i = 1; i < trackerData.length; i++) {
+    const row     = trackerData[i];
+    const dateStr = normaliseDateCell(row[0]);
+    if (!dateStr) continue;
+    const pk = String(row[2]).trim();
+    if (pk === '__state__') continue;
+    seen[`${dateStr}|${pk}`] = {
+      dateStr, pk,
+      status:   String(row[3]),
+      owner:    String(row[4] || '').trim(),
+      sheetRow: parseInt(row[5]) || 0
+    };
+  }
+
+  // Overlay today's in-memory statuses (more up to date than sheet)
+  const memCache = getCachedStatuses();
+  if (memCache && memCache.dateStr === today) {
+    for (const [pk, status] of Object.entries(memCache.statuses || {})) {
+      const k = `${today}|${pk}`;
+      if (seen[k]) seen[k].status = status;
+    }
+  }
+
+  const byDate = {};
+  const dateOrder = [];
+
+  for (const entry of Object.values(seen)) {
+    if (entry.status === 'posted') continue;
+    const { dateStr, pk, owner, sheetRow } = entry;
+
+    let postName = '', postingTime = '', label = '', platforms = '', resolvedOwner = owner;
+
+    if (sheetRow && postData.length >= sheetRow) {
+      const postRow = postData[sheetRow - 1];
+      if (COL.posted > -1 && (postRow[COL.posted] === true || String(postRow[COL.posted]).toUpperCase() === 'TRUE')) continue;
+      if (COL.title  > -1) postName  = String(postRow[COL.title]  || '').trim();
+      if (COL.time   > -1) postingTime = normaliseTimeCell(postRow[COL.time]);
+      if (COL.owner  > -1 && !resolvedOwner) resolvedOwner = String(postRow[COL.owner] || '').trim();
+      if (COL.account > -1) {
+        const parsed = parsePost(postRow, COL);
+        if (parsed.length) {
+          const collapsed = collapsePlatforms(parsed);
+          const handle    = pk.split('|')[1] || '';
+          const match     = collapsed.find(p => p.handle === handle) || collapsed[0];
+          if (match) { label = match.label; platforms = match.platforms || match.platform || ''; }
+        }
+      }
+    }
+
+    if (!postName) postName = (pk.split('|')[0] || pk).replace(/-/g, ' ');
+
+    if (!byDate[dateStr]) { byDate[dateStr] = []; dateOrder.push(dateStr); }
+    byDate[dateStr].push({ dateStr, postName, postingTime, label, platforms, owner: resolvedOwner });
+  }
+
+  // Sort: most recent date first, then by time within date
+  dateOrder.sort((a, b) => {
+    const da = DateTime.fromFormat(a, 'dd MMM yyyy', { zone: TIMEZONE });
+    const db = DateTime.fromFormat(b, 'dd MMM yyyy', { zone: TIMEZONE });
+    return db.toMillis() - da.toMillis();
+  });
+  for (const d of dateOrder) {
+    byDate[d].sort((a, b) => {
+      if (!a.postingTime) return 1;
+      if (!b.postingTime) return -1;
+      return DateTime.fromFormat(a.postingTime, 'h:mm a').toMillis()
+           - DateTime.fromFormat(b.postingTime, 'h:mm a').toMillis();
+    });
+  }
+
+  const posts = dateOrder.flatMap(d => byDate[d]);
+  _outstandingCache = { posts, fetchedAt: Date.now() };
+  return posts;
 }
 
 // ── PENDING REMINDER TEXT ─────────────────────────────────────
@@ -593,6 +693,8 @@ async function getBotUsername() {
 // ── SEND MORNING DIGEST ───────────────────────────────────────
 async function sendMorningDigest() {
   try {
+    _outstandingCache = null;
+    _sentTimeReminders.clear();
     const dateStr = getTodayString();
     const posts   = await getPostsForDate(dateStr);
     if (!posts.length) { console.log('No posts today — morning skipped.'); return; }
@@ -823,20 +925,12 @@ async function handleUpdate(update) {
         }
 
       } else if (cmd('pending')) {
-        const cachedData = getCachedStatuses();
-        if (!cachedData || cachedData.dateStr !== getTodayString()) {
-          await reply('No digest sent today yet. Use /morning to send one.');
-        } else {
-          const statuses = cachedData.statuses || {};
-          const cache    = getCachedGrouped();
-          const flat     = cache ? cache.flat : [];
-          const pending  = flat.filter(p => (statuses[postKey(p)] || 'pending') === 'pending');
-          const msg      = buildPendingMessage(pending, 0);
-          await telegramRequest('sendMessage', {
-            chat_id: replyChat, text: msg.text,
-            parse_mode: 'Markdown', reply_markup: msg.keyboard
-          });
-        }
+        const outstanding = await getOutstandingPosts();
+        const msg = buildPendingMessage(outstanding, 0);
+        await telegramRequest('sendMessage', {
+          chat_id: replyChat, text: msg.text,
+          parse_mode: 'Markdown', reply_markup: msg.keyboard
+        });
 
       } else if (cmd('help')) {
         await reply(
@@ -866,13 +960,9 @@ async function handleUpdate(update) {
 
   // Pending pagination — handle before numeric target resolution
   if (action === 'pending_page') {
-    const page       = parseInt(target) || 0;
-    const cachedData = getCachedStatuses();
-    const statuses   = cachedData?.statuses || {};
-    const cache      = getCachedGrouped();
-    const flat       = cache ? cache.flat : [];
-    const pending    = flat.filter(p => (statuses[postKey(p)] || 'pending') === 'pending');
-    const msg        = buildPendingMessage(pending, page);
+    const page        = parseInt(target) || 0;
+    const outstanding = await getOutstandingPosts();
+    const msg         = buildPendingMessage(outstanding, page);
     await editTelegramMessage(
       String(cq.message.chat.id),
       String(cq.message.message_id),
@@ -930,6 +1020,7 @@ async function handleUpdate(update) {
 
       if (statuses[target] !== newStatus) {
         statuses[target] = newStatus;
+        _outstandingCache = null;
         if (cachedData) { cachedData.statuses = statuses; setCachedStatuses(cachedData); }
         // Write to Sheets in background — don't block the message edit
         if (rowIndices[target]) {
