@@ -433,7 +433,12 @@ function buildPendingMessage(allPending, page) {
 
   let text = `📋 *Outstanding — ${page + 1} of ${totalPages}* (${allPending.length} total)\n\n`;
   let lastDate = '';
-  for (const p of slice) {
+  const buttons = [];
+
+  for (let i = 0; i < slice.length; i++) {
+    const p      = slice[i];
+    const absIdx = page * PAGE_SIZE + i;
+
     if (p.dateStr !== lastDate) {
       if (lastDate) text += '\n';
       text += `📅 *${p.dateStr}*\n`;
@@ -446,13 +451,18 @@ function buildPendingMessage(allPending, page) {
     const mention = ownerMention(p.owner);
     if (mention) text += ` (${mention})`;
     text += '\n';
+
+    let btnLabel = `${p.label || ''}${p.platforms ? ' | ' + p.platforms : ''} — ${p.postName}`;
+    if (btnLabel.length > 40) btnLabel = btnLabel.slice(0, 37) + '…';
+    buttons.push([{ text: '✅ ' + btnLabel, callback_data: `pending_tick|${page}|${absIdx}` }]);
   }
 
   const navRow = [];
   if (page > 0)              navRow.push({ text: '◀️ Prev', callback_data: `pending_page|${page - 1}` });
   if (page < totalPages - 1) navRow.push({ text: 'Next ▶️', callback_data: `pending_page|${page + 1}` });
+  if (navRow.length) buttons.push(navRow);
 
-  return { text: text.trim(), keyboard: { inline_keyboard: navRow.length ? [navRow] : [] } };
+  return { text: text.trim(), keyboard: { inline_keyboard: buttons } };
 }
 
 // ── OUTSTANDING POSTS (all dates, Sheets-backed) ──────────────
@@ -480,9 +490,10 @@ async function getOutstandingPosts() {
     if (pk === '__state__') continue;
     seen[`${dateStr}|${pk}`] = {
       dateStr, pk,
-      status:   String(row[3]),
-      owner:    String(row[4] || '').trim(),
-      sheetRow: parseInt(row[5]) || 0
+      status:     String(row[3]),
+      owner:      String(row[4] || '').trim(),
+      sheetRow:   parseInt(row[5]) || 0,
+      trackerRow: i + 1
     };
   }
 
@@ -500,7 +511,7 @@ async function getOutstandingPosts() {
 
   for (const entry of Object.values(seen)) {
     if (entry.status === 'posted') continue;
-    const { dateStr, pk, owner, sheetRow } = entry;
+    const { dateStr, pk, owner, sheetRow, trackerRow } = entry;
 
     let postName = '', postingTime = '', label = '', platforms = '', resolvedOwner = owner;
 
@@ -524,7 +535,7 @@ async function getOutstandingPosts() {
     if (!postName) postName = (pk.split('|')[0] || pk).replace(/-/g, ' ');
 
     if (!byDate[dateStr]) { byDate[dateStr] = []; dateOrder.push(dateStr); }
-    byDate[dateStr].push({ dateStr, postName, postingTime, label, platforms, owner: resolvedOwner });
+    byDate[dateStr].push({ dateStr, postName, postingTime, label, platforms, owner: resolvedOwner, pk, trackerRow });
   }
 
   // Sort: most recent date first, then by time within date
@@ -938,7 +949,7 @@ async function handleUpdate(update) {
           '/morning — Send today\'s digest (or refresh if already sent)\n' +
           '/refresh — Refresh digest with new posts from sheet\n' +
           '/reminder — Check pending posts now\n' +
-          '/pending — List all outstanding posts\n' +
+          '/pending — List all outstanding posts (tap ✅ to mark as posted)\n' +
           '/status — Today\'s post count summary\n' +
           '/syncposted — Sync posted column in sheet\n' +
           '/help — Show this list'
@@ -970,6 +981,52 @@ async function handleUpdate(update) {
       msg.keyboard
     );
     await answerCallbackQuery(cq.id, '');
+    return;
+  }
+
+  // Mark a post as posted from the /pending list
+  if (action === 'pending_tick') {
+    await answerCallbackQuery(cq.id, '✅ Marked posted!');
+    await withLock(async () => {
+      const tickParts = target.split('|');
+      const page      = parseInt(tickParts[0]) || 0;
+      const absIdx    = parseInt(tickParts[1]);
+
+      const outstanding = await getOutstandingPosts();
+      const ticked      = outstanding[absIdx];
+      if (!ticked) return;
+
+      // Update Bot_Tracker sheet
+      if (ticked.trackerRow) {
+        await updateCell(TRACKER_SHEET, ticked.trackerRow, 4, 'posted').catch(e => console.error('pending_tick tracker write:', e));
+      } else {
+        await appendRows(TRACKER_SHEET, [[ticked.dateStr, '', ticked.pk, 'posted', ticked.owner || '', '']]).catch(e => console.error('pending_tick tracker append:', e));
+      }
+
+      // If today's post, keep morning digest in sync
+      const today = getTodayString();
+      if (ticked.dateStr === today) {
+        const cached = getCachedStatuses();
+        if (cached) {
+          cached.statuses[ticked.pk] = 'posted';
+          setCachedStatuses(cached);
+          const cache        = getCachedGrouped();
+          const grouped      = cache ? cache.grouped : groupByOwner(collapsePlatforms(await getPostsForDate(today)));
+          const pendingLines = getCachedPendingLines();
+          const rebuilt      = buildFullMessage(grouped, today, cached.statuses, pendingLines);
+          const msgs         = cached.messages || [];
+          if (msgs.length) await editAllMessages(msgs, rebuilt.text, rebuilt.keyboard).catch(() => {});
+        }
+      }
+
+      // Rebuild pending view
+      _outstandingCache = null;
+      const fresh      = await getOutstandingPosts();
+      const totalPages = Math.max(1, Math.ceil(fresh.length / PAGE_SIZE));
+      const clampedPg  = Math.min(page, totalPages - 1);
+      const msg        = buildPendingMessage(fresh, clampedPg);
+      await editTelegramMessage(String(cq.message.chat.id), String(cq.message.message_id), msg.text, msg.keyboard);
+    });
     return;
   }
 
@@ -1107,7 +1164,7 @@ async function registerCommands() {
         { command: 'morning',     description: "Send today's digest (or refresh if already sent)" },
         { command: 'refresh',     description: 'Refresh digest with new posts from sheet' },
         { command: 'reminder',    description: 'Check pending posts now' },
-        { command: 'pending',     description: 'List all outstanding posts' },
+        { command: 'pending',     description: 'List all outstanding posts (tap ✅ to mark posted)' },
         { command: 'status',      description: "Today's post count summary" },
         { command: 'syncposted',  description: 'Sync posted column in sheet' },
         { command: 'help',        description: 'Show all commands' },
